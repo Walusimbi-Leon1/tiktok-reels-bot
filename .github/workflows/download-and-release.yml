@@ -45,7 +45,6 @@ jobs:
             esac
           fi
           echo "sources:"; cat -n sources.txt
-          cp sources.txt "$GITHUB_ENV" 2>/dev/null || true
 
       - name: Download up to 20 trending videos (≤1080p, titled filenames)
         run: |
