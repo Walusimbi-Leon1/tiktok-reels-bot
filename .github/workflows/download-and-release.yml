@@ -1,0 +1,108 @@
+name: Download TikTok Videos → GitHub Release
+
+on:
+  schedule:
+    # daily at 09:00 UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag prefix (e.g. daily)'
+        required: false
+        default: 'daily'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create a release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg jq
+          pipx install yt-dlp
+
+      - name: Download 20 trending videos (highest quality ≤1080p, with titles)
+        run: |
+          mkdir -p downloaded
+          # For You feed = trending, no auth required.
+          # Output filename uses the real video TITLE → "downloaded/<title> [<id>].mp4"
+          yt-dlp \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+            -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]" \
+            --merge-output-format mp4 \
+            --remux-video mp4 \
+            --no-part --no-overwrite \
+            --concurrent-fragments 8 \
+            --sleep-interval 1 --max-sleep-interval 3 \
+            --retries infinite --fragment-retries 10 \
+            --write-info-json \
+            --playlist-end 20 \
+            --output "downloaded/%(title)s [%(id)s].%(ext)s" \
+            "https://www.tiktok.com/foryou" \
+            || echo "WARN: partial/failed download — keeping whatever succeeded"
+
+      - name: Build manifest (title + id + uploader + size)
+        run: |
+          python3 - <<'PY'
+          import json, glob, os
+          videos = []
+          for mp4 in sorted(glob.glob("downloaded/*.mp4")):
+              base = os.path.splitext(mp4)[0]
+              meta = base + ".info.json"
+              title = desc = uploader = vid_id = ""
+              if os.path.exists(meta):
+                  try:
+                      m = json.load(open(meta))
+                      title = m.get("title","")
+                      desc  = m.get("description","")
+                      uploader = m.get("uploader","") or m.get("uploader_id","")
+                      vid_id = m.get("id","")
+                  except Exception:
+                      pass
+              videos.append({
+                  "file": os.path.basename(mp4),
+                  "title": title,
+                  "uploader": uploader,
+                  "id": vid_id,
+                  "size_mb": round(os.path.getsize(mp4)/1e6, 1),
+              })
+          out = {"videos": videos, "count": len(videos)}
+          json.dump(out, open("manifest.json","w"), indent=2, ensure_ascii=False)
+          print(f"Manifest: {len(videos)} videos")
+          for v in videos:
+              print(f"  - {v['title'][:60]}…  @{v['uploader']}  {v['size_mb']}MB")
+          PY
+
+      - name: Create or reuse today's release
+        id: release
+        run: |
+          # Build a dated tag from the prefix so every daily run gets its own release.
+          DATE="$(date -u +%Y-%m-%d)"
+          REL_TAG="${{ inputs.tag }}-${DATE}"
+          echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
+
+          gh release view "$REL_TAG" -R "${{ github.repository }}" >/dev/null 2>&1 \
+            && echo "Reusing existing release: $REL_TAG" \
+            || gh release create "$REL_TAG" -R "${{ github.repository }}" \
+                 --title "TikTok batch — $DATE" \
+                 --notes "20 trending TikTok videos downloaded via yt-dlp. See manifest.json for titles + metadata."
+
+      - name: Upload videos + manifest as release assets
+        run: |
+          TAG="${{ steps.release.outputs.release_tag }}"
+          gh release upload "$TAG" \
+            manifest.json \
+            downloaded/*.mp4 \
+            -R "${{ github.repository }}" \
+            --clobber
+          echo "=== Release assets ==="
+          gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[].name'
+
+      - name: Summary
+        run: |
+          TAG="${{ steps.release.outputs.release_tag }}"
+          echo "=== ✅ Finished. Videos are on the release: ==="
+          gh release view "$TAG" -R "${{ github.repository }}" --json html_url | jq -r '.html_url'
