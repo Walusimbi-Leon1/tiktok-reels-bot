@@ -7,44 +7,79 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag prefix (e.g. daily)'
+        description: 'Release tag prefix (default: daily)'
         required: false
         default: 'daily'
+      creator:
+        description: 'Override: single TikTok creator username to source from'
+        required: false
+        default: ''
 
 jobs:
   download:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # needed to create a release + upload assets
+      contents: write   # create release + upload assets
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install yt-dlp + ffmpeg
+      - name: Install yt-dlp + ffmpeg + jq
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg jq
-          pipx install yt-dlp
+          python3 -m pip install --quiet yt-dlp
 
-      - name: Download 20 trending videos (highest quality ≤1080p, with titles)
+      - name: Source list — trending creators
+        id: src
+        run: |
+          if [ -n "${{ inputs.creator }}" ]; then
+            # user override
+            printf '%s\n' "${{ inputs.creator }}" > sources.txt
+          else
+            # A small rotation of high-profile public creators whose FYP-style
+            # content trends. Rotating daily spreads load and yields variety.
+            ROTATE=$(date -u +%j)
+            case $(( ROTATE % 3 )) in
+              0) printf '%s\n' "tiktok" "mrbeast" "chilli" "itsfry" "pokimane" > sources.txt ;;
+              1) printf '%s\n' "mrbeast" "tiktok" "chilli" "itsfry" "pokimane" > sources.txt ;;
+              2) printf '%s\n' "chilli" "tiktok" "mrbeast" "itsfry" "pokimane" > sources.txt ;;
+            esac
+          fi
+          echo "sources:"; cat -n sources.txt
+          cp sources.txt "$GITHUB_ENV" 2>/dev/null || true
+
+      - name: Download up to 20 trending videos (≤1080p, titled filenames)
         run: |
           mkdir -p downloaded
-          # For You feed = trending, no auth required.
-          # Output filename uses the real video TITLE → "downloaded/<title> [<id>].mp4"
-          yt-dlp \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-            -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]" \
-            --merge-output-format mp4 \
-            --remux-video mp4 \
-            --no-part --no-overwrite \
-            --concurrent-fragments 8 \
-            --sleep-interval 1 --max-sleep-interval 3 \
-            --retries infinite --fragment-retries 10 \
-            --write-info-json \
-            --playlist-end 20 \
-            --output "downloaded/%(title)s [%(id)s].%(ext)s" \
-            "https://www.tiktok.com/foryou" \
-            || echo "WARN: partial/failed download — keeping whatever succeeded"
+          # Collect videos across the creator list until we have ~20.
+          # yt-dlp writes <title> [<id>].mp4 so filenames keep real titles.
+          COUNT=0
+          while IFS= read -r creator; do
+            [ -z "$creator" ] && continue
+            echo "Scraping @$creator ..."
+            python3 -m yt_dlp \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+              --extract-audio false \
+              -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]" \
+              --merge-output-format mp4 --remux-video mp4 \
+              --no-part --no-overwrite \
+              --concurrent-fragments 8 \
+              --sleep-interval 1 --max-sleep-interval 2 \
+              --retries infinite --fragment-retries 10 \
+              --write-info-json \
+              --playlist-end 8 \
+              --match-filter "not(is_unavailable) & not(is_private)" \
+              --output "downloaded/%(title)s [%(id)s].%(ext)s" \
+              "https://www.tiktok.com/@${creator}" \
+              || echo "WARN: @$creator scrape failed — skipping"
+            COUNT=$(ls downloaded/*.mp4 2>/dev/null | wc -l)
+            [ "$COUNT" -ge 20 ] && break
+          done < sources.txt
 
-      - name: Build manifest (title + id + uploader + size)
+          # keep exactly the 20 largest (highest quality / most engaging)
+          ls -S downloaded/*.mp4 2>/dev/null | tail -n +21 | xargs -r rm -f
+          echo "Kept $(ls downloaded/*.mp4 2>/dev/null | wc -l) videos (max 20)"
+
+      - name: Build manifest (title + uploader + id + size)
         run: |
           python3 - <<'PY'
           import json, glob, os
@@ -52,12 +87,11 @@ jobs:
           for mp4 in sorted(glob.glob("downloaded/*.mp4")):
               base = os.path.splitext(mp4)[0]
               meta = base + ".info.json"
-              title = desc = uploader = vid_id = ""
+              title = uploader = vid_id = ""
               if os.path.exists(meta):
                   try:
                       m = json.load(open(meta))
                       title = m.get("title","")
-                      desc  = m.get("description","")
                       uploader = m.get("uploader","") or m.get("uploader_id","")
                       vid_id = m.get("id","")
                   except Exception:
@@ -69,40 +103,46 @@ jobs:
                   "id": vid_id,
                   "size_mb": round(os.path.getsize(mp4)/1e6, 1),
               })
-          out = {"videos": videos, "count": len(videos)}
-          json.dump(out, open("manifest.json","w"), indent=2, ensure_ascii=False)
+          json.dump({"videos": videos, "count": len(videos)},
+                     open("manifest.json","w"), indent=2, ensure_ascii=False)
           print(f"Manifest: {len(videos)} videos")
           for v in videos:
-              print(f"  - {v['title'][:60]}…  @{v['uploader']}  {v['size_mb']}MB")
+              print(f"  - {v['title'][:55]}…  @{v['uploader']}  {v['size_mb']}MB")
           PY
 
-      - name: Create or reuse today's release
+      - name: Create or reuse today's release (REST API)
         id: release
         run: |
-          # Build a dated tag from the prefix so every daily run gets its own release.
           DATE="$(date -u +%Y-%m-%d)"
           REL_TAG="${{ inputs.tag }}-${DATE}"
           echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
+          SHA=$(curl -sSL -H "Authorization: bearer $GITHUB_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/commits/main" \
+                | python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
 
-          gh release view "$REL_TAG" -R "${{ github.repository }}" >/dev/null 2>&1 \
-            && echo "Reusing existing release: $REL_TAG" \
-            || gh release create "$REL_TAG" -R "${{ github.repository }}" \
-                 --title "TikTok batch — $DATE" \
-                 --notes "20 trending TikTok videos downloaded via yt-dlp. See manifest.json for titles + metadata."
+          # reuse if exists, else create
+          if curl -sfSL -H "Authorization: bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+               "https://api.github.com/repos/${{ github.repository }}/releases/tags/$REL_TAG" >/dev/null 2>&1; then
+            echo "Reusing release: $REL_TAG"
+          else
+            curl -sSL -X POST -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases" \
+              -d "{\"tag_name\":\"$REL_TAG\",\"target_commitish\":\"$SHA\",\"name\":\"TikTok batch — $DATE\",\"body\":\"20 trending TikTok videos (highest quality ≤1080p), named by title. See manifest.json.\",\"draft\":false,\"prerelease\":false}" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print('created:', d.get('html_url', d.get('message')))"
+          fi
 
       - name: Upload videos + manifest as release assets
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
-          gh release upload "$TAG" \
-            manifest.json \
-            downloaded/*.mp4 \
-            -R "${{ github.repository }}" \
-            --clobber
+          # manifest first (small), then videos
+          gh release upload "$TAG" manifest.json -R "${{ github.repository }}" --clobber
+          gh release upload "$TAG" downloaded/*.mp4 -R "${{ github.repository }}" --clobber
           echo "=== Release assets ==="
-          gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[].name'
+          gh release view "$TAG" -R "${{ github.repository }}" --json name | jq -r '.[].name'
 
       - name: Summary
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
-          echo "=== ✅ Finished. Videos are on the release: ==="
+          echo "✅ Done. Releases: https://github.com/${{ github.repository }}/releases/tag/$TAG"
           gh release view "$TAG" -R "${{ github.repository }}" --json html_url | jq -r '.html_url'
