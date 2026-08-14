@@ -162,7 +162,7 @@ jobs:
           echo "=== Release assets ($(ls downloaded/video_*.mp4 2>/dev/null | wc -l) videos) ==="
           gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name'
 
-      - name: Publish CORS-friendly feed to feed branch (browser reads directly)
+      - name: Publish CORS-friendly feed.json (browser reads via raw.githubusercontent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -195,13 +195,26 @@ jobs:
           json.dump(feed, open("feed.json", "w"), indent=2, ensure_ascii=False)
           print(f"feed.json: {len(videos)} videos, tag {os.environ['REL_TAG']}")
           PY
-          git config user.email "bot@walusimbi.com"
-          git config user.name "TikTok Reels Bot"
-          git fetch origin feed:feed 2>/dev/null || git checkout --orphan feed
-          cp feed.json manifest.json .
-          git add feed.json manifest.json
-          git commit -m "feed update ${STAMP}" || echo "nothing to commit"
-          git push origin feed
+          # Publish feed.json + manifest.json to the `feed` branch via the GitHub API.
+          # raw.githubusercontent.com serves this branch with Access-Control-Allow-Origin: *.
+          python3 - <<'PY'
+          import json, os, base64, urllib.request, urllib.error
+          TOKEN = os.environ["GH_TOKEN"]
+          REPO = os.environ["REPO"]
+          STAMP = os.environ["STAMP"]
+          def put_file(path, content):
+              url = f"https://api.github.com/repos/{REPO}/contents/{path}?ref=feed"
+              body = {"message": f"feed update {STAMP}", "content": base64.b64encode(content.encode()).decode(), "branch": "feed"}
+              req = urllib.request.Request(url, data=json.dumps(body).encode(), method="PUT",
+                  headers={"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"})
+              try:
+                  r = urllib.request.urlopen(req)
+                  print(f"  PUT {path}: {r.status}")
+              except urllib.error.HTTPError as e:
+                  print(f"  PUT {path}: {e.code} {e.read().decode()[:200]}")
+          for fn in ("feed.json", "manifest.json"):
+              put_file(fn, open(fn, encoding="utf-8").read())
+          PY
 
       - name: Summary
         run: |
