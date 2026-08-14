@@ -23,7 +23,7 @@ jobs:
   download:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create release + upload assets
+      contents: write   # create release + upload assets + push feed branch
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +52,6 @@ jobs:
             # rotate the order so each 30-min run starts a different creator
             ROT=$(( HOUR % 5 ))
             for i in $(seq 1 $ROT); do
-              # rotate first line to back
               tail -n 1 sources.txt > /tmp/_rot.txt; head -n -1 sources.txt >> /tmp/_rot.txt; mv /tmp/_rot.txt sources.txt
             done
           fi
@@ -66,8 +65,6 @@ jobs:
           while IFS= read -r creator; do
             [ -z "$creator" ] && continue
             echo "Scraping @$creator ..."
-            # yt-dlp saves to `raw/` using the video TITLE in the filename.
-            # We sanitize afterward so GitHub release assets have safe names.
             python3 -m yt_dlp \
               --impersonate "chrome-136" \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
@@ -87,23 +84,19 @@ jobs:
             [ "$COUNT" -ge "$MAX_V" ] && break
           done < sources.txt
 
-          # keep exactly the MAX_V largest (highest quality)
           ls -S raw/*.mp4 2>/dev/null | tail -n +$((MAX_V + 1)) | xargs -r rm -f
           echo "Raw videos: $(ls raw/*.mp4 2>/dev/null | wc -l)"
 
       - name: Sanitize filenames (keep titles in manifest)
         run: |
-          MAX_V="${{ env.max_videos }}"
           mkdir -p downloaded
           n=0
           for f in raw/*.mp4; do
             [ -f "$f" ] || continue
             n=$((n+1))
-            # safe filename: video_01_<videoid>.mp4
             vidid=$(python3 -c "import json,os;b=os.path.splitext(os.path.basename('$f'))[0];m=b[b.rfind('[')+1:b.rfind(']')];print(m)" 2>/dev/null || echo "$n")
             cp "$f" "downloaded/video_$(printf '%04d' $n)_${vidid}.mp4"
           done
-          # carry the info.json files (renamed) so manifest builder can read titles
           for j in raw/*.info.json; do
             [ -f "$j" ] || continue
             base=$(basename "$j" .info.json)
@@ -117,7 +110,6 @@ jobs:
           python3 - <<'PY'
           import json, glob, os, re
           videos = []
-          # match sanitized mp4 to its meta json by videoid
           meta_by_id = {}
           for jf in glob.glob("downloaded/video_meta_*.json"):
               try:
@@ -126,7 +118,6 @@ jobs:
               except Exception:
                   pass
           for mp4 in sorted(glob.glob("downloaded/video_*.mp4")):
-              # extract videoid from filename: video_0001_<vidid>.mp4
               m = re.search(r'video_\d+_([0-9a-zA-Z-]+)\.mp4$', mp4)
               vid_id = m.group(1) if m else ""
               meta = meta_by_id.get(vid_id, {})
@@ -149,12 +140,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Each 30-min run → a fresh timestamped release (reels-YYYY-MM-DD-HHMM)
-          # so the Worker can always fetch the latest batch without conflicts.
           STAMP="$(date -u +%Y-%m-%d-%H%M)"
           REL_TAG="${{ inputs.tag }}-${STAMP}"
           echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
-
           gh release create "$REL_TAG" -R "${{ github.repository }}" \
                --title "TikTok Reels batch — $STAMP UTC" \
                --notes "Fresh batch of ${MAX_V} trending TikTok reels (highest quality ≤1080p). Filenames sanitized; manifest.json maps each to real title/uploader/id."
@@ -173,6 +161,47 @@ jobs:
           done
           echo "=== Release assets ($(ls downloaded/video_*.mp4 2>/dev/null | wc -l) videos) ==="
           gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name'
+
+      - name: Publish CORS-friendly feed to feed branch (browser reads directly)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STAMP="$(date -u +%Y-%m-%d-%H%M)"
+          REL_TAG="${{ steps.release.outputs.release_tag }}"
+          REPO="${{ github.repository }}"
+          python3 - <<PY
+          import json, os
+          manifest = json.load(open("manifest.json"))
+          base = f"https://github.com/{os.environ['REPO']}/releases/download/{os.environ['REL_TAG']}/"
+          videos = []
+          for v in manifest.get("videos", []):
+              videos.append({
+                  "file": v["file"],
+                  "title": v.get("title", "(unknown)"),
+                  "uploader": v.get("uploader", ""),
+                  "id": v.get("id", ""),
+                  "size_mb": v.get("size_mb", 0),
+                  "url": base + v["file"],
+                  "thumb": (f"https://www.tiktok.com/@{v.get('uploader','')}/video/{v.get('id','')}" if v.get("id") else ""),
+              })
+          feed = {
+              "videos": videos,
+              "count": len(videos),
+              "releaseTag": os.environ["REL_TAG"],
+              "releaseName": f"TikTok Reels batch — {os.environ['STAMP']} UTC",
+              "seedDay": None,
+              "updatedAt": "${{ github.event.head_commit.timestamp }}",
+          }
+          json.dump(feed, open("feed.json", "w"), indent=2, ensure_ascii=False)
+          print(f"feed.json: {len(videos)} videos, tag {os.environ['REL_TAG']}")
+          PY
+          git config user.email "bot@walusimbi.com"
+          git config user.name "TikTok Reels Bot"
+          git fetch origin feed:feed 2>/dev/null || git checkout --orphan feed
+          cp feed.json manifest.json .
+          git add feed.json manifest.json
+          git commit -m "feed update ${STAMP}" || echo "nothing to commit"
+          git push origin feed
 
       - name: Summary
         run: |
