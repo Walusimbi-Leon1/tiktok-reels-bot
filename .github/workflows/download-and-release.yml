@@ -56,7 +56,7 @@ jobs:
               --impersonate "chrome-136" \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
               -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]" \
-              --merge-output-format mp4 --remux-video mp4 \
+              --merge-output-format mp4 \
               --no-part --no-overwrite \
               --concurrent-fragments 8 \
               --sleep-interval 1 --max-sleep-interval 2 \
@@ -114,26 +114,31 @@ jobs:
           REL_TAG="${{ inputs.tag }}-${DATE}"
           echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
 
-          # create a fresh release for today's date (tag becomes the build id)
           gh release view "$REL_TAG" -R "${{ github.repository }}" >/dev/null 2>&1 \
             && echo "Reusing release: $REL_TAG (already exists)" \
             || gh release create "$REL_TAG" -R "${{ github.repository }}" \
                  --title "TikTok batch — $DATE" \
                  --notes "20 trending TikTok videos (highest quality ≤1080p), named by title. See manifest.json."
 
-      - name: Upload videos + manifest as release assets
+      - name: Upload manifest + videos as release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
-          gh release upload "$TAG" manifest.json -R "${{ github.repository }}" --clobber
-          gh release upload "$TAG" downloaded/*.mp4 -R "${{ github.repository }}" --clobber
+          REPO="${{ github.repository }}"
+          # manifest first (small)
+          gh release upload "$TAG" manifest.json -R "$REPO" --clobber
+          # upload each mp4 individually — filenames contain ! # @ emoji :
+          # which break a single glob expansion under set -e
+          shopt -s nullglob
+          for f in downloaded/*.mp4; do
+            gh release upload "$TAG" "$f" -R "$REPO" --clobber \
+              || echo "WARN: failed to upload $f — continuing"
+          done
           echo "=== Release assets ==="
-          gh release view "$TAG" -R "${{ github.repository }}" --json name | jq -r '.[].name'
+          gh release view "$TAG" -R "$REPO" --json name | jq -r '.[].name'
 
       - name: Summary
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
           echo "✅ Done. Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
