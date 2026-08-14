@@ -23,20 +23,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install yt-dlp + ffmpeg + jq
+      - name: Install yt-dlp + ffmpeg + jq + curl-cffi (for TikTok impersonation)
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg jq
-          python3 -m pip install --quiet yt-dlp
+          python3 -m pip install --quiet "yt-dlp[curl-cffi]"
 
       - name: Source list — trending creators
         id: src
         run: |
           if [ -n "${{ inputs.creator }}" ]; then
-            # user override
             printf '%s\n' "${{ inputs.creator }}" > sources.txt
           else
-            # A small rotation of high-profile public creators whose FYP-style
-            # content trends. Rotating daily spreads load and yields variety.
+            # A small rotation of high-profile public creators whose content
+            # trends on the FYP. Rotation spreads load + gives variety.
             ROTATE=$(date -u +%j)
             case $(( ROTATE % 3 )) in
               0) printf '%s\n' "tiktok" "mrbeast" "chilli" "itsfry" "pokimane" > sources.txt ;;
@@ -49,15 +48,13 @@ jobs:
       - name: Download up to 20 trending videos (≤1080p, titled filenames)
         run: |
           mkdir -p downloaded
-          # Collect videos across the creator list until we have ~20.
-          # yt-dlp writes <title> [<id>].mp4 so filenames keep real titles.
           COUNT=0
           while IFS= read -r creator; do
             [ -z "$creator" ] && continue
             echo "Scraping @$creator ..."
             python3 -m yt_dlp \
+              --impersonate "chrome-136" \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-              --extract-audio false \
               -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]" \
               --merge-output-format mp4 --remux-video mp4 \
               --no-part --no-overwrite \
@@ -66,15 +63,14 @@ jobs:
               --retries infinite --fragment-retries 10 \
               --write-info-json \
               --playlist-end 8 \
-              --match-filter "not(is_unavailable) & not(is_private)" \
               --output "downloaded/%(title)s [%(id)s].%(ext)s" \
               "https://www.tiktok.com/@${creator}" \
-              || echo "WARN: @$creator scrape failed — skipping"
+              || echo "WARN: @$creator scrape failed — continuing"
             COUNT=$(ls downloaded/*.mp4 2>/dev/null | wc -l)
             [ "$COUNT" -ge 20 ] && break
           done < sources.txt
 
-          # keep exactly the 20 largest (highest quality / most engaging)
+          # keep exactly the 20 largest (highest quality)
           ls -S downloaded/*.mp4 2>/dev/null | tail -n +21 | xargs -r rm -f
           echo "Kept $(ls downloaded/*.mp4 2>/dev/null | wc -l) videos (max 20)"
 
@@ -109,39 +105,35 @@ jobs:
               print(f"  - {v['title'][:55]}…  @{v['uploader']}  {v['size_mb']}MB")
           PY
 
-      - name: Create or reuse today's release (REST API)
+      - name: Create or reuse today's release
         id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           DATE="$(date -u +%Y-%m-%d)"
           REL_TAG="${{ inputs.tag }}-${DATE}"
           echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
-          SHA=$(curl -sSL -H "Authorization: bearer $GITHUB_TOKEN" \
-                "https://api.github.com/repos/${{ github.repository }}/commits/main" \
-                | python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
 
-          # reuse if exists, else create
-          if curl -sfSL -H "Authorization: bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-               "https://api.github.com/repos/${{ github.repository }}/releases/tags/$REL_TAG" >/dev/null 2>&1; then
-            echo "Reusing release: $REL_TAG"
-          else
-            curl -sSL -X POST -H "Authorization: bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases" \
-              -d "{\"tag_name\":\"$REL_TAG\",\"target_commitish\":\"$SHA\",\"name\":\"TikTok batch — $DATE\",\"body\":\"20 trending TikTok videos (highest quality ≤1080p), named by title. See manifest.json.\",\"draft\":false,\"prerelease\":false}" \
-              | python3 -c "import json,sys; d=json.load(sys.stdin); print('created:', d.get('html_url', d.get('message')))"
-          fi
+          # create a fresh release for today's date (tag becomes the build id)
+          gh release view "$REL_TAG" -R "${{ github.repository }}" >/dev/null 2>&1 \
+            && echo "Reusing release: $REL_TAG (already exists)" \
+            || gh release create "$REL_TAG" -R "${{ github.repository }}" \
+                 --title "TikTok batch — $DATE" \
+                 --notes "20 trending TikTok videos (highest quality ≤1080p), named by title. See manifest.json."
 
       - name: Upload videos + manifest as release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
-          # manifest first (small), then videos
           gh release upload "$TAG" manifest.json -R "${{ github.repository }}" --clobber
           gh release upload "$TAG" downloaded/*.mp4 -R "${{ github.repository }}" --clobber
           echo "=== Release assets ==="
           gh release view "$TAG" -R "${{ github.repository }}" --json name | jq -r '.[].name'
 
       - name: Summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
-          echo "✅ Done. Releases: https://github.com/${{ github.repository }}/releases/tag/$TAG"
-          gh release view "$TAG" -R "${{ github.repository }}" --json html_url | jq -r '.html_url'
+          echo "✅ Done. Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
