@@ -165,10 +165,12 @@ jobs:
       - name: Publish CORS-friendly feed.json (browser reads via raw.githubusercontent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REL_TAG: ${{ steps.release.outputs.release_tag }}
+          REPO: ${{ github.repository }}
         run: |
           STAMP="$(date -u +%Y-%m-%d-%H%M)"
-          REL_TAG="${{ steps.release.outputs.release_tag }}"
-          REPO="${{ github.repository }}"
+          export REL_TAG="${{ steps.release.outputs.release_tag }}"
+          export REPO="${{ github.repository }}"
           python3 - <<PY
           import json, os
           manifest = json.load(open("manifest.json"))
