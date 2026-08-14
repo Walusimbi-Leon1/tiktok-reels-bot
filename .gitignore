@@ -1,0 +1,4 @@
+# This is where downloaded videos land during a run.
+downloaded/
+*.mp4.download
+__pycache__/
