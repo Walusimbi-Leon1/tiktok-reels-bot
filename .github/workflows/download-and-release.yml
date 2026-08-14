@@ -45,13 +45,15 @@ jobs:
           fi
           echo "sources:"; cat -n sources.txt
 
-      - name: Download up to 20 trending videos (≤1080p, titled filenames)
+      - name: Download 20 trending videos (highest quality ≤1080p, real titles)
         run: |
-          mkdir -p downloaded
+          mkdir -p downloaded raw
           COUNT=0
           while IFS= read -r creator; do
             [ -z "$creator" ] && continue
             echo "Scraping @$creator ..."
+            # yt-dlp saves to `raw/` using the video TITLE in the filename.
+            # We sanitize afterward so GitHub release assets have safe names.
             python3 -m yt_dlp \
               --impersonate "chrome-136" \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
@@ -63,38 +65,59 @@ jobs:
               --retries infinite --fragment-retries 10 \
               --write-info-json \
               --playlist-end 8 \
-              --output "downloaded/%(title)s [%(id)s].%(ext)s" \
+              --output "raw/%(title)s [%(id)s].%(ext)s" \
               "https://www.tiktok.com/@${creator}" \
               || echo "WARN: @$creator scrape failed — continuing"
-            COUNT=$(ls downloaded/*.mp4 2>/dev/null | wc -l)
+            COUNT=$(ls raw/*.mp4 2>/dev/null | wc -l)
             [ "$COUNT" -ge 20 ] && break
           done < sources.txt
 
           # keep exactly the 20 largest (highest quality)
-          ls -S downloaded/*.mp4 2>/dev/null | tail -n +21 | xargs -r rm -f
-          echo "Kept $(ls downloaded/*.mp4 2>/dev/null | wc -l) videos (max 20)"
+          ls -S raw/*.mp4 2>/dev/null | tail -n +21 | xargs -r rm -f
+          echo "Raw videos: $(ls raw/*.mp4 2>/dev/null | wc -l)"
 
-      - name: Build manifest (title + uploader + id + size)
+      - name: Sanitize filenames (keep titles in manifest)
+        run: |
+          mkdir -p downloaded
+          n=0
+          for f in raw/*.mp4; do
+            [ -f "$f" ] || continue
+            n=$((n+1))
+            # safe filename: video_01_<videoid>.mp4
+            vidid=$(python3 -c "import json,os;b=os.path.splitext(os.path.basename('$f'))[0];m=b[b.rfind('[')+1:b.rfind(']')];print(m)" 2>/dev/null || echo "$n")
+            cp "$f" "downloaded/video_$(printf '%02d' $n)_${vidid}.mp4"
+          done
+          # carry the info.json files (renamed) so manifest builder can read titles
+          for j in raw/*.info.json; do
+            [ -f "$j" ] || continue
+            base=$(basename "$j" .info.json)
+            vidid=$(python3 -c "b='$base';print(b[b.rfind('[')+1:b.rfind(']')])" 2>/dev/null || echo "?")
+            cp "$j" "downloaded/video_meta_${vidid}.json"
+          done
+          echo "Sanitized: $(ls downloaded/*.mp4 2>/dev/null | wc -l) videos in downloaded/"
+
+      - name: Build manifest (real title + uploader + id + size)
         run: |
           python3 - <<'PY'
-          import json, glob, os
+          import json, glob, os, re
           videos = []
-          for mp4 in sorted(glob.glob("downloaded/*.mp4")):
-              base = os.path.splitext(mp4)[0]
-              meta = base + ".info.json"
-              title = uploader = vid_id = ""
-              if os.path.exists(meta):
-                  try:
-                      m = json.load(open(meta))
-                      title = m.get("title","")
-                      uploader = m.get("uploader","") or m.get("uploader_id","")
-                      vid_id = m.get("id","")
-                  except Exception:
-                      pass
+          # match sanitized mp4 to its meta json by videoid
+          meta_by_id = {}
+          for jf in glob.glob("downloaded/video_meta_*.json"):
+              try:
+                  m = json.load(open(jf))
+                  meta_by_id[m.get("id","")] = m
+              except Exception:
+                  pass
+          for mp4 in sorted(glob.glob("downloaded/video_*.mp4")):
+              # extract videoid from filename: video_01_<vidid>.mp4
+              m = re.search(r'video_\d+_([0-9a-zA-Z-]+)\.mp4$', mp4)
+              vid_id = m.group(1) if m else ""
+              meta = meta_by_id.get(vid_id, {})
               videos.append({
                   "file": os.path.basename(mp4),
-                  "title": title,
-                  "uploader": uploader,
+                  "title": meta.get("title","(unknown)"),
+                  "uploader": meta.get("uploader", meta.get("uploader_id","")),
                   "id": vid_id,
                   "size_mb": round(os.path.getsize(mp4)/1e6, 1),
               })
@@ -118,20 +141,17 @@ jobs:
             && echo "Reusing release: $REL_TAG (already exists)" \
             || gh release create "$REL_TAG" -R "${{ github.repository }}" \
                  --title "TikTok batch — $DATE" \
-                 --notes "20 trending TikTok videos (highest quality ≤1080p), named by title. See manifest.json."
+                 --notes "20 trending TikTok videos (highest quality ≤1080p). Filenames are sanitized; manifest.json maps each to its real title/uploader/id. Download from assets below."
 
-      - name: Upload manifest + videos as release assets
+      - name: Upload sanitized videos + manifest as release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
           REPO="${{ github.repository }}"
-          # manifest first (small)
           gh release upload "$TAG" manifest.json -R "$REPO" --clobber
-          # upload each mp4 individually — filenames contain ! # @ emoji :
-          # which break a single glob expansion under set -e
           shopt -s nullglob
-          for f in downloaded/*.mp4; do
+          for f in downloaded/video_*.mp4; do
             gh release upload "$TAG" "$f" -R "$REPO" --clobber \
               || echo "WARN: failed to upload $f — continuing"
           done
