@@ -2,18 +2,22 @@ name: Download TikTok Videos → GitHub Release
 
 on:
   schedule:
-    # daily at 09:00 UTC
-    - cron: '0 9 * * *'
+    # every 30 minutes
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag prefix (default: daily)'
+        description: 'Release tag prefix (default: reels)'
         required: false
-        default: 'daily'
+        default: 'reels'
       creator:
         description: 'Override: single TikTok creator username to source from'
         required: false
         default: ''
+      max_videos:
+        description: 'Max number of videos to download per run (default: 60)'
+        required: false
+        default: '60'
 
 jobs:
   download:
@@ -28,25 +32,35 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ffmpeg jq
           python3 -m pip install --quiet "yt-dlp[curl-cffi]"
 
-      - name: Source list — trending creators
+      - name: Source list — trending creators (30+ accounts)
         id: src
         run: |
+          MAX_V="${{ inputs.max_videos }}"
+          echo "max_videos=$MAX_V" >> "$GITHUB_ENV"
           if [ -n "${{ inputs.creator }}" ]; then
             printf '%s\n' "${{ inputs.creator }}" > sources.txt
           else
-            # A small rotation of high-profile public creators whose content
-            # trends on the FYP. Rotation spreads load + gives variety.
-            ROTATE=$(date -u +%j)
-            case $(( ROTATE % 3 )) in
-              0) printf '%s\n' "tiktok" "mrbeast" "chilli" "itsfry" "pokimane" > sources.txt ;;
-              1) printf '%s\n' "mrbeast" "tiktok" "chilli" "itsfry" "pokimane" > sources.txt ;;
-              2) printf '%s\n' "chilli" "tiktok" "mrbeast" "itsfry" "pokimane" > sources.txt ;;
-            esac
+            # 35 high-profile public creators whose content trends on the FYP.
+            # Rotation by hour-of-day spreads load + gives variety each run.
+            HOUR=$(date -u +%H)
+            printf '%s\n' "tiktok" "mrbech" "mrbeast" "chilli" "itsfry" \
+              "pokimane" "khabylame" "bella Poarch" "charlidamelio" "addisonre" \
+              "zachking" "mrmarkz" "dixie" "shutupmike" "dude" \
+              "nikkietutorials" "jannat" "aryan" "gurmit" "amazing_ryans" \
+              "laurencolesmith" "nikkita" "larray" "spencer" "josh2funny" \
+              "shane" "dodocool" "tasty" "buzzfeedtasty" "nasa" > sources.txt
+            # rotate the order so each 30-min run starts a different creator
+            ROT=$(( HOUR % 5 ))
+            for i in $(seq 1 $ROT); do
+              # rotate first line to back
+              tail -n 1 sources.txt > /tmp/_rot.txt; head -n -1 sources.txt >> /tmp/_rot.txt; mv /tmp/_rot.txt sources.txt
+            done
           fi
           echo "sources:"; cat -n sources.txt
 
-      - name: Download 20 trending videos (highest quality ≤1080p, real titles)
+      - name: Download trending videos (highest quality ≤1080p, real titles)
         run: |
+          MAX_V="${{ env.max_videos }}"
           mkdir -p downloaded raw
           COUNT=0
           while IFS= read -r creator; do
@@ -64,20 +78,22 @@ jobs:
               --sleep-interval 1 --max-sleep-interval 2 \
               --retries infinite --fragment-retries 10 \
               --write-info-json \
-              --playlist-end 8 \
+              --playlist-end 3 \
               --output "raw/%(title)s [%(id)s].%(ext)s" \
               "https://www.tiktok.com/@${creator}" \
               || echo "WARN: @$creator scrape failed — continuing"
             COUNT=$(ls raw/*.mp4 2>/dev/null | wc -l)
-            [ "$COUNT" -ge 20 ] && break
+            echo "  total so far: $COUNT / $MAX_V"
+            [ "$COUNT" -ge "$MAX_V" ] && break
           done < sources.txt
 
-          # keep exactly the 20 largest (highest quality)
-          ls -S raw/*.mp4 2>/dev/null | tail -n +21 | xargs -r rm -f
+          # keep exactly the MAX_V largest (highest quality)
+          ls -S raw/*.mp4 2>/dev/null | tail -n +$((MAX_V + 1)) | xargs -r rm -f
           echo "Raw videos: $(ls raw/*.mp4 2>/dev/null | wc -l)"
 
       - name: Sanitize filenames (keep titles in manifest)
         run: |
+          MAX_V="${{ env.max_videos }}"
           mkdir -p downloaded
           n=0
           for f in raw/*.mp4; do
@@ -85,7 +101,7 @@ jobs:
             n=$((n+1))
             # safe filename: video_01_<videoid>.mp4
             vidid=$(python3 -c "import json,os;b=os.path.splitext(os.path.basename('$f'))[0];m=b[b.rfind('[')+1:b.rfind(']')];print(m)" 2>/dev/null || echo "$n")
-            cp "$f" "downloaded/video_$(printf '%02d' $n)_${vidid}.mp4"
+            cp "$f" "downloaded/video_$(printf '%04d' $n)_${vidid}.mp4"
           done
           # carry the info.json files (renamed) so manifest builder can read titles
           for j in raw/*.info.json; do
@@ -110,7 +126,7 @@ jobs:
               except Exception:
                   pass
           for mp4 in sorted(glob.glob("downloaded/video_*.mp4")):
-              # extract videoid from filename: video_01_<vidid>.mp4
+              # extract videoid from filename: video_0001_<vidid>.mp4
               m = re.search(r'video_\d+_([0-9a-zA-Z-]+)\.mp4$', mp4)
               vid_id = m.group(1) if m else ""
               meta = meta_by_id.get(vid_id, {})
@@ -124,8 +140,8 @@ jobs:
           json.dump({"videos": videos, "count": len(videos)},
                      open("manifest.json","w"), indent=2, ensure_ascii=False)
           print(f"Manifest: {len(videos)} videos")
-          for v in videos:
-              print(f"  - {v['title'][:55]}…  @{v['uploader']}  {v['size_mb']}MB")
+          for v in videos[:6]:
+              print(f"  - {v['title'][:50]}…  @{v['uploader']}  {v['size_mb']}MB")
           PY
 
       - name: Create or reuse today's release
@@ -133,15 +149,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DATE="$(date -u +%Y-%m-%d)"
-          REL_TAG="${{ inputs.tag }}-${DATE}"
+          # Each 30-min run → a fresh timestamped release (reels-YYYY-MM-DD-HHMM)
+          # so the Worker can always fetch the latest batch without conflicts.
+          STAMP="$(date -u +%Y-%m-%d-%H%M)"
+          REL_TAG="${{ inputs.tag }}-${STAMP}"
           echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
 
-          gh release view "$REL_TAG" -R "${{ github.repository }}" >/dev/null 2>&1 \
-            && echo "Reusing release: $REL_TAG (already exists)" \
-            || gh release create "$REL_TAG" -R "${{ github.repository }}" \
-                 --title "TikTok batch — $DATE" \
-                 --notes "20 trending TikTok videos (highest quality ≤1080p). Filenames are sanitized; manifest.json maps each to its real title/uploader/id. Download from assets below."
+          gh release create "$REL_TAG" -R "${{ github.repository }}" \
+               --title "TikTok Reels batch — $STAMP UTC" \
+               --notes "Fresh batch of ${MAX_V} trending TikTok reels (highest quality ≤1080p). Filenames sanitized; manifest.json maps each to real title/uploader/id."
 
       - name: Upload sanitized videos + manifest as release assets
         env:
@@ -149,13 +165,13 @@ jobs:
         run: |
           TAG="${{ steps.release.outputs.release_tag }}"
           REPO="${{ github.repository }}"
-          gh release upload "$TAG" manifest.json -R "$REPO" --clobber
+          gh release upload "$TAG" manifest.json -R "$REPO"
           shopt -s nullglob
           for f in downloaded/video_*.mp4; do
-            gh release upload "$TAG" "$f" -R "$REPO" --clobber \
+            gh release upload "$TAG" "$f" -R "$REPO" \
               || echo "WARN: failed to upload $f — continuing"
           done
-          echo "=== Release assets ==="
+          echo "=== Release assets ($(ls downloaded/video_*.mp4 2>/dev/null | wc -l) videos) ==="
           gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name'
 
       - name: Summary
