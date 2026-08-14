@@ -202,11 +202,31 @@ jobs:
           TOKEN = os.environ["GH_TOKEN"]
           REPO = os.environ["REPO"]
           STAMP = os.environ["STAMP"]
+          BRANCH = "feed"
+          AUTH = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"}
+
+          def api(method, url, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(url, data=data, method=method, headers=AUTH)
+              return urllib.request.urlopen(req)
+
+          # Create the feed branch from the default branch's HEAD (first run only).
+          try:
+              head = json.load(api("GET", f"https://api.github.com/repos/{REPO}/git/refs/heads/main"))["object"]["sha"]
+              api("POST", f"https://api.github.com/repos/{REPO}/git/refs",
+                  {"ref": f"refs/heads/{BRANCH}", "sha": head})
+              print(f"  created branch {BRANCH} at {head[:10]}")
+          except urllib.error.HTTPError as e:
+              msg = e.read().decode()
+              if e.code == 422 and "already exists" in msg:
+                  print(f"  branch {BRANCH} exists")
+              else:
+                  print(f"  branch create: {e.code} {msg[:200]}")
+
           def put_file(path, content):
-              url = f"https://api.github.com/repos/{REPO}/contents/{path}?ref=feed"
-              body = {"message": f"feed update {STAMP}", "content": base64.b64encode(content.encode()).decode(), "branch": "feed"}
-              req = urllib.request.Request(url, data=json.dumps(body).encode(), method="PUT",
-                  headers={"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"})
+              url = f"https://api.github.com/repos/{REPO}/contents/{path}"
+              body = {"message": f"feed update {STAMP}", "content": base64.b64encode(content.encode()).decode(), "branch": BRANCH}
+              req = urllib.request.Request(url, data=json.dumps(body).encode(), method="PUT", headers=AUTH)
               try:
                   r = urllib.request.urlopen(req)
                   print(f"  PUT {path}: {r.status}")
