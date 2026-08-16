@@ -2,7 +2,6 @@ name: Download TikTok Videos → GitHub Release
 
 on:
   schedule:
-    # every 30 minutes
     - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
@@ -23,7 +22,7 @@ jobs:
   download:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create release + upload assets + push feed branch
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +39,6 @@ jobs:
           if [ -n "${{ inputs.creator }}" ]; then
             printf '%s\n' "${{ inputs.creator }}" > sources.txt
           else
-            # 35 high-profile public creators whose content trends on the FYP.
-            # Rotation by hour-of-day spreads load + gives variety each run.
             HOUR=$(date -u +%H)
             printf '%s\n' "tiktok" "mrbech" "mrbeast" "chilli" "itsfry" \
               "pokimane" "khabylame" "bella Poarch" "charlidamelio" "addisonre" \
@@ -49,7 +46,6 @@ jobs:
               "nikkietutorials" "jannat" "aryan" "gurmit" "amazing_ryans" \
               "laurencolesmith" "nikkita" "larray" "spencer" "josh2funny" \
               "shane" "dodocool" "tasty" "buzzfeedtasty" "nasa" > sources.txt
-            # rotate the order so each 30-min run starts a different creator
             ROT=$(( HOUR % 5 ))
             for i in $(seq 1 $ROT); do
               tail -n 1 sources.txt > /tmp/_rot.txt; head -n -1 sources.txt >> /tmp/_rot.txt; mv /tmp/_rot.txt sources.txt
@@ -86,6 +82,38 @@ jobs:
 
           ls -S raw/*.mp4 2>/dev/null | tail -n +$((MAX_V + 1)) | xargs -r rm -f
           echo "Raw videos: $(ls raw/*.mp4 2>/dev/null | wc -l)"
+
+      - name: Re-encode videos for broad browser compatibility (H.264/AAC, SDR)
+        run: |
+          # TikTok sources frequently ship HEVC/H.265, HDR, or high-bitrate
+          # streams that desktop browsers (Chrome/Firefox) cannot decode and
+          # that Instagram's web uploader rejects with "could not be read by
+          # your browser". We transcode every file to a universally safe
+          # profile: H.264 video + AAC audio, Rec.709, 1080p max, fast decode.
+          mkdir -p recoded
+          for f in raw/*.mp4; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            of="recoded/${base}"
+            ffmpeg -hide_banner -loglevel error -y \
+              -i "$f" \
+              -map 0:v -map 0:a? \
+              -c:v libx264 -preset superfast -crf 23 \
+              -vf "scale=if(gt(iw,1920),1920,-1):if(gt(ih,1080),1080,-1):force_original_aspect_ratio=decrease,format=yuv420p,setsar=1" \
+              -x264-params "log-level=error:profile=baseline:level=4.0" \
+              -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
+              -c:a aac -b:a 128k -ar 44100 -ac 2 \
+              -movflags +faststart \
+              "$of"
+            # Replace the raw file with the re-encoded one (preserve title [id].mp4 name).
+            if [ -s "$of" ]; then
+              mv "$of" "$f"
+            else
+              echo "WARN: re-encode produced nothing for $base — keeping original"
+              rm -f "$of"
+            fi
+          done
+          echo "Re-encoded: $(ls raw/*.mp4 2>/dev/null | wc -l) videos in raw/"
 
       - name: Sanitize filenames (keep titles in manifest)
         run: |
@@ -145,7 +173,7 @@ jobs:
           echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
           gh release create "$REL_TAG" -R "${{ github.repository }}" \
                --title "TikTok Reels batch — $STAMP UTC" \
-               --notes "Fresh batch of ${MAX_V} trending TikTok reels (highest quality ≤1080p). Filenames sanitized; manifest.json maps each to real title/uploader/id."
+               --notes "Fresh batch of ${MAX_V} trending TikTok reels (highest quality ≤1080p, re-encoded to H.264/AAC for browser & Instagram compatibility). Filenames sanitized; manifest.json maps each to real title/uploader/id."
 
       - name: Upload sanitized videos + manifest as release assets
         env:
@@ -195,8 +223,6 @@ jobs:
           json.dump(feed, open("feed.json", "w"), indent=2, ensure_ascii=False)
           print(f"feed.json: {len(videos)} videos, tag {os.environ['REL_TAG']}")
           PY
-          # Publish feed.json + manifest.json to the `feed` branch via the GitHub API.
-          # raw.githubusercontent.com serves this branch with Access-Control-Allow-Origin: *.
           python3 - <<'PY'
           import json, os, base64, urllib.request, urllib.error
           TOKEN = os.environ["GH_TOKEN"]
@@ -204,17 +230,13 @@ jobs:
           STAMP = os.environ["STAMP"]
           BRANCH = "feed"
           AUTH = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"}
-
           def api(method, url, body=None):
               data = json.dumps(body).encode() if body is not None else None
               req = urllib.request.Request(url, data=data, method=method, headers=AUTH)
               return urllib.request.urlopen(req)
-
-          # Create the feed branch from the default branch's HEAD (first run only).
           try:
               head = json.load(api("GET", f"https://api.github.com/repos/{REPO}/git/refs/heads/main"))["object"]["sha"]
-              api("POST", f"https://api.github.com/repos/{REPO}/git/refs",
-                  {"ref": f"refs/heads/{BRANCH}", "sha": head})
+              api("POST", f"https://api.github.com/repos/{REPO}/git/refs", {"ref": f"refs/heads/{BRANCH}", "sha": head})
               print(f"  created branch {BRANCH} at {head[:10]}")
           except urllib.error.HTTPError as e:
               msg = e.read().decode()
@@ -222,7 +244,6 @@ jobs:
                   print(f"  branch {BRANCH} exists")
               else:
                   print(f"  branch create: {e.code} {msg[:200]}")
-
           def put_file(path, content):
               url = f"https://api.github.com/repos/{REPO}/contents/{path}"
               body = {"message": f"feed update {STAMP}", "content": base64.b64encode(content.encode()).decode(), "branch": BRANCH}
